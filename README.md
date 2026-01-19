@@ -2,6 +2,8 @@
 
 A lightweight, secure, and extremely resource-efficient Telegram bot designed to wake computers via **Wake-on-LAN (WOL)**. It is specifically optimized for **routers** (Keenetic, ASUS, OpenWRT) and SBCs with limited RAM and CPU.
 
+https://deepwiki.com/Mat1RX/WakeOnLan-Telergam-bot
+
 ## ✨ Features
 
 * **Ultra-low Footprint**: Binary size is **~1MB** (UPX compressed) and uses **< 5MB of RAM**.
