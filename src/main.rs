@@ -1,146 +1,246 @@
-use std::{collections::HashMap, fs, sync::Arc, env, time::Duration};
-use teloxide::{prelude::*, types::Message};
-use teloxide::utils::command::BotCommands;
 use serde::Deserialize;
-use wake_on_lan::MagicPacket;
-use mac_address::MacAddress;
-use tokio::process::Command as AsyncCommand;
+use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::net::UdpSocket;
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use teloxide::prelude::*;
+use teloxide::types::ParseMode;
 
-// --- СТРУКТУРЫ ---
-#[derive(Deserialize)]
-struct FileConfig {
-    allowed_users: Vec<u64>,
-    devices: HashMap<String, Vec<String>>,
+/// Configuration structure mapped from the TOML file
+#[derive(Deserialize, Debug, Clone)]
+struct Config {
+    allowed_users: Vec<u64>,               // Telegram User IDs permitted to use the bot
+    interface: Option<String>,             // Network interface (e.g., "br-lan")
+    devices: HashMap<String, (String, String)>, // Device name -> (MAC Address, IP Address)
 }
 
-struct DeviceInfo {
-    mac: [u8; 6],
-    ip: String,
+/// Helper function to generate a Unix timestamp string for logging
+fn get_time() -> String {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{}", now)
 }
 
-struct SafeConfig {
-    allowed_users: Vec<UserId>,
-    devices: HashMap<String, DeviceInfo>,
+/// Macro for standardized info logging to stdout
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        println!("[{}] [INFO] {}", get_time(), format!($($arg)*));
+    };
 }
 
-#[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase")]
-enum Command {
-    #[command(description = "show help")] Help,
-    #[command(description = "list devices")] List,
-    #[command(description = "wake device")] Wake(String),
-    #[command(description = "check status")] Status(String),
+/// Macro for standardized error logging to stderr
+macro_rules! log_err {
+    ($($arg:tt)*) => {
+        eprintln!("[{}] [ERROR] {}", get_time(), format!($($arg)*));
+    };
 }
 
-// --- ФУНКЦИИ ---
-async fn check_online(ip: &str, name: &str) -> bool {
-    println!("[PING] Checking status for {} ({})", name, ip);
-    let ok = AsyncCommand::new("ping")
-        .args(["-c", "1", "-W", "1", ip])
-        .output()
-        .await
-        .map(|res| res.status.success())
-        .unwrap_or(false);
-    
-    println!("[PING] Result for {}: {}", name, if ok { "ONLINE" } else { "OFFLINE" });
-    ok
+/// Constructs a Wake-on-LAN Magic Packet
+/// A Magic Packet consists of 6 bytes of 0xFF followed by 16 repetitions of the target MAC
+fn create_magic_packet(mac: &str) -> Result<Vec<u8>, String> {
+    // Parse MAC string (e.g., "AA:BB:CC...") into bytes
+    let mac_bytes: Vec<u8> = mac
+        .split(|c| c == ':' || c == '-')
+        .filter(|s| !s.is_empty())
+        .map(|b| u8::from_str_radix(b, 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .map_err(|_| "Invalid MAC address format".to_string())?;
+
+    if mac_bytes.len() != 6 {
+        return Err("MAC address must be exactly 6 bytes".to_string());
+    }
+
+    let mut packet = vec![0xFF; 6];
+    for _ in 0..16 {
+        packet.extend_from_slice(&mac_bytes);
+    }
+    Ok(packet)
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    println!("--- Starting WOL Bot ---");
+/// Creates a UDP socket and binds it to a specific physical interface
+/// Binding to an interface (like br-lan) ensures the packet stays within the local network
+fn create_wol_socket(interface: Option<&str>) -> std::io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_broadcast(true)?; // Required to send to 255.255.255.255
 
-    let bot_token = env::var("TELOXIDE_TOKEN")
-        .map(|t| t.trim().to_string())
-        .expect("TELOXIDE_TOKEN not set");
-    
-    let config_raw = fs::read_to_string("config.toml").expect("Missing config.toml");
-    let file_config: FileConfig = toml::from_str(&config_raw).expect("Invalid config.toml");
-
-    let mut devices = HashMap::new();
-    for (name, params) in file_config.devices {
-        if params.len() == 2 {
-            if let Ok(mac) = params[0].parse::<MacAddress>() {
-                devices.insert(name.clone(), DeviceInfo { mac: mac.bytes(), ip: params[1].clone() });
-                println!("[INIT] Device loaded: {} ({})", name, params[1]);
+    if let Some(iface) = interface {
+        #[cfg(target_os = "linux")]
+        {
+            // Binds the socket to a device (MIPS/OpenWrt specific optimization)
+            if let Err(e) = socket.bind_device(Some(iface.as_bytes())) {
+                log_err!("Failed to bind to interface {}: {}", iface, e);
+            } else {
+                log_info!("Socket successfully bound to interface: {}", iface);
             }
         }
     }
+    Ok(socket.into())
+}
 
-    let config = Arc::new(SafeConfig {
-        allowed_users: file_config.allowed_users.into_iter().map(UserId).collect(),
-        devices,
+/// Executes a system 'ping' command to check if a device is reachable
+async fn is_device_online(ip: &str) -> bool {
+    log_info!("Pinging IP: {}...", ip);
+    // -c 1: one packet, -W 1: one second timeout
+    let status = Command::new("ping")
+        .args(["-c", "1", "-W", "1", ip])
+        .status();
+    match status {
+        Ok(s) => s.success(),
+        Err(e) => {
+            log_err!("Ping command failed for {}: {}", ip, e);
+            false
+        }
+    }
+}
+
+#[tokio::main(flavor = "current_thread")] // Single-threaded runtime to save RAM on MT7621
+async fn main() {
+    // 1. Collect CLI arguments to find the config file path
+    let args: Vec<String> = env::args().collect();
+    let config_path = args.get(1).map(|s| s.as_str()).unwrap_or("config.toml");
+
+    log_info!("Starting WOL Bot. Target config: {}", config_path);
+
+    // 2. Read and parse the TOML configuration
+    let content = match fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            log_err!("FATAL: Could not read config file {}: {}", config_path, e);
+            return;
+        }
+    };
+
+    // Use the turbofish operator ::<Config> to clarify the target type
+    let config: Arc<Config> = Arc::new(match toml::from_str::<Config>(&content) {
+        Ok(c) => {
+            log_info!("Configuration loaded. Monitoring {} devices.", c.devices.len());
+            c
+        },
+        Err(e) => {
+            log_err!("FATAL: TOML parse error: {}", e);
+            return;
+        }
     });
 
-    println!("[INIT] Allowed users: {}", config.allowed_users.len());
-    println!("[INIT] Bot is ready and listening...");
+    // 3. Initialize Telegram Bot client (Token is pulled from TELOXIDE_TOKEN env var)
+    let bot = Bot::from_env();
+    log_info!("Telegram Bot client initialized.");
 
-    let bot = Bot::new(bot_token);
-
-    Command::repl(bot, move |bot: Bot, msg: Message, cmd: Command| {
-        let conf = config.clone();
-        async move {
+    // 4. Define the message processing logic
+    let handler = Update::filter_message().endpoint(
+        move |bot: Bot, config: Arc<Config>, msg: Message| async move {
             let user = msg.from();
-            let user_id = user.map(|u| u.id).unwrap_or(UserId(0));
+            let user_id = user.map(|u| u.id.0).unwrap_or(0);
             let username = user.and_then(|u| u.username.as_deref()).unwrap_or("unknown");
 
-            // SECURITY LOG
-            if !conf.allowed_users.contains(&user_id) {
-                eprintln!("[UNAUTHORIZED] ID: {} (@{}) tried to use the bot", user_id, username);
-                return Ok(());
+            // Log every incoming command for audit
+            if let Some(text) = msg.text() {
+                log_info!("Message from {} (ID: {}): {}", username, user_id, text);
             }
 
-            match cmd {
-                Command::Help => {
-                    println!("[CMD] Help requested by {}", user_id);
-                    bot.send_message(msg.chat.id, Command::descriptions().to_string()).await?;
-                }
-                Command::List => {
-                    println!("[CMD] List requested by {}", user_id);
-                    let mut res = String::from("🖥 <b>Devices:</b>\n");
-                    for name in conf.devices.keys() {
-                        res.push_str(&format!("• <code>{}</code>\n", name));
-                    }
-                    bot.send_message(msg.chat.id, res).parse_mode(teloxide::types::ParseMode::Html).await?;
-                }
-                Command::Status(name) => {
-                    println!("[CMD] Status check for '{}' by {}", name, user_id);
-                    if let Some(info) = conf.devices.get(&name) {
-                        let is_up = check_online(&info.ip, &name).await;
-                        bot.send_message(msg.chat.id, if is_up { "✅ Online" } else { "💤 Offline" }).await?;
-                    } else {
-                        bot.send_message(msg.chat.id, "❌ Device not found").await?;
-                    }
-                }
-                Command::Wake(name) => {
-                    println!("[CMD] Wake request for '{}' by {}", name, user_id);
-                    if let Some(info) = conf.devices.get(&name) {
-                        let _ = MagicPacket::new(&info.mac).send();
-                        println!("[WOL] Magic Packet sent to {}", name);
-                        
-                        bot.send_message(msg.chat.id, format!("🚀 Waking {}...", name)).await?;
-                        
-                        let b = bot.clone();
-                        let ip = info.ip.clone();
-                        let cid = msg.chat.id;
-                        let n = name.clone();
+            // Security check: drop requests from unauthorized users
+            if !config.allowed_users.contains(&user_id) {
+                log_err!("AUTH DENIED: User {} (ID: {}) is not authorized.", username, user_id);
+                return ResponseResult::Ok(());
+            }
 
-                        tokio::spawn(async move {
-                            println!("[TASK] Waiting 30s to verify {}...", n);
-                            tokio::time::sleep(Duration::from_secs(30)).await;
-                            let is_up = check_online(&ip, &n).await;
-                            let _ = b.send_message(cid, if is_up { 
-                                format!("✅ <b>{}</b> is now UP!", n) 
-                            } else { 
-                                format!("⚠️ <b>{}</b> no response after 30s", n) 
-                            }).parse_mode(teloxide::types::ParseMode::Html).await;
-                        });
-                    } else {
-                        bot.send_message(msg.chat.id, "❌ Device not found").await?;
+            let text = msg.text().unwrap_or_default();
+            let parts: Vec<&str> = text.split_whitespace().collect();
+            let cmd = parts.get(0).copied().unwrap_or("");
+
+            match cmd {
+                "/start" | "/help" => {
+                    bot.send_message(msg.chat.id, "<b>🤖 WOL Bot Menu</b>\n\n<code>/list</code>, <code>/status_all</code>, <code>/wake &lt;name&gt;</code>")
+                        .parse_mode(ParseMode::Html).await?;
+                }
+
+                "/list" => {
+                    log_info!("User {} requested device list.", username);
+                    let mut list = String::from("<b>📋 Configured Devices:</b>\n");
+                    for name in config.devices.keys() {
+                        list.push_str(&format!("• <code>{}</code>\n", name));
+                    }
+                    bot.send_message(msg.chat.id, list).parse_mode(ParseMode::Html).await?;
+                }
+
+                "/status_all" => {
+                    log_info!("User {} requested bulk status check.", username);
+                    let mut report = String::from("<b>🔍 Network Status:</b>\n");
+                    for (name, (_, ip)) in &config.devices {
+                        let online = is_device_online(ip).await;
+                        let status = if online { "✅ ONLINE" } else { "🔴 OFFLINE" };
+                        log_info!("Device {}({}) status: {}", name, ip, status);
+                        report.push_str(&format!("• <code>{}</code>: {}\n", name, status));
+                    }
+                    bot.send_message(msg.chat.id, report).parse_mode(ParseMode::Html).await?;
+                }
+
+                "/status" => {
+                    if let Some(name) = parts.get(1) {
+                        if let Some((_, ip)) = config.devices.get(*name) {
+                            let online = is_device_online(ip).await;
+                            let status = if online { "✅ ONLINE" } else { "🔴 OFFLINE" };
+                            log_info!("Single status check for {}: {}", name, status);
+                            bot.send_message(msg.chat.id, format!("Device <code>{}</code> is {}", name, status))
+                                .parse_mode(ParseMode::Html).await?;
+                        }
                     }
                 }
-            };
-            Ok(())
-        }
-    }).await;
+
+                "/wake" => {
+                    if let Some(name) = parts.get(1) {
+                        if let Some((mac, ip)) = config.devices.get(*name) {
+                            log_info!("WAKE REQUEST: User {} is waking {} ({})", username, name, mac);
+                            
+                            // Prepare packet and socket
+                            let packet = create_magic_packet(mac).unwrap();
+                            let socket = create_wol_socket(config.interface.as_deref()).unwrap();
+                            
+                            // Send to broadcast address on port 9 (standard WOL port)
+                            match socket.send_to(&packet, "255.255.255.255:9") {
+                                Ok(_) => {
+                                    log_info!("Magic Packet successfully broadcasted for {}.", name);
+                                    bot.send_message(msg.chat.id, format!("🚀 Packet sent to <code>{}</code>. Verifying...", name))
+                                        .parse_mode(ParseMode::Html).await?;
+                                },
+                                Err(e) => {
+                                    log_err!("Failed to send Magic Packet for {}: {}", name, e);
+                                    bot.send_message(msg.chat.id, "❌ Network error.").await?;
+                                    return ResponseResult::Ok(());
+                                }
+                            }
+
+                            // Wait for the OS to boot up before checking status
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            
+                            let final_status = if is_device_online(ip).await { "✅ ONLINE" } else { "⚠️ STILL OFFLINE" };
+                            log_info!("Post-wake verification for {}: {}", name, final_status);
+                            bot.send_message(msg.chat.id, format!("Result for <code>{}</code>: {}", name, final_status))
+                                .parse_mode(ParseMode::Html).await?;
+                        } else {
+                            log_err!("WAKE FAILED: Device '{}' not found.", name);
+                            bot.send_message(msg.chat.id, "❌ Device not found.").await?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            ResponseResult::Ok(())
+        },
+    );
+
+    // 5. Start the event dispatcher
+    // Dependencies are injected here so they can be accessed inside the handler above
+    Dispatcher::builder(bot, handler)
+        .dependencies(dptree::deps![config])
+        .enable_ctrlc_handler() // Allows clean shutdown with Ctrl+C
+        .build()
+        .dispatch()
+        .await;
 }
