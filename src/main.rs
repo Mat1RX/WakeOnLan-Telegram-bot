@@ -15,7 +15,7 @@ use teloxide::types::ParseMode;
 struct Config {
     allowed_users: Vec<u64>,               // Telegram User IDs permitted to use the bot
     interface: Option<String>,             // Network interface (e.g., "br-lan")
-    devices: HashMap<String, (String, String)>, // Device name -> (MAC Address, IP Address)
+    devices: HashMap<String, (String, String, String)>, // Device name -> (MAC Address, IP Address, Timeout)
 }
 
 /// Helper function to generate a Unix timestamp string for logging
@@ -172,7 +172,7 @@ async fn main() {
                 "/status_all" => {
                     log_info!("User {} requested bulk status check.", username);
                     let mut report = String::from("<b>🔍 Network Status:</b>\n");
-                    for (name, (_, ip)) in &config.devices {
+                    for (name, (_, ip, _)) in &config.devices {
                         let online = is_device_online(ip).await;
                         let status = if online { "✅ ONLINE" } else { "🔴 OFFLINE" };
                         log_info!("Device {}({}) status: {}", name, ip, status);
@@ -183,7 +183,7 @@ async fn main() {
 
                 "/status" => {
                     if let Some(name) = parts.get(1) {
-                        if let Some((_, ip)) = config.devices.get(*name) {
+                        if let Some((_, ip, _)) = config.devices.get(*name) {
                             let online = is_device_online(ip).await;
                             let status = if online { "✅ ONLINE" } else { "🔴 OFFLINE" };
                             log_info!("Single status check for {}: {}", name, status);
@@ -196,7 +196,8 @@ async fn main() {
                 "/wake" => {
                     if let Some(name) = parts.get(1) {
                         if let Some((mac, ip)) = config.devices.get(*name) {
-                            log_info!("WAKE REQUEST: User {} is waking {} ({})", username, name, mac);
+                            let timeout_secs: u64 = timeout_str.parse().unwrap_or(30);
+                            log_info!("WAKE REQUEST: User {} is waking {} ({}), timeout: {}", username, name, mac, timeout_secs);
                             
                             // Prepare packet and socket
                             let packet = create_magic_packet(mac).unwrap();
@@ -206,7 +207,7 @@ async fn main() {
                             match socket.send_to(&packet, "255.255.255.255:9") {
                                 Ok(_) => {
                                     log_info!("Magic Packet successfully broadcasted for {}.", name);
-                                    bot.send_message(msg.chat.id, format!("🚀 Packet sent to <code>{}</code>. Verifying...", name))
+                                    bot.send_message(msg.chat.id, format!("🚀 Packet sent to <code>{}</code>. Verifying in {}s...", name, timeout_secs))
                                         .parse_mode(ParseMode::Html).await?;
                                 },
                                 Err(e) => {
@@ -217,7 +218,7 @@ async fn main() {
                             }
 
                             // Wait for the OS to boot up before checking status
-                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
                             
                             let final_status = if is_device_online(ip).await { "✅ ONLINE" } else { "⚠️ STILL OFFLINE" };
                             log_info!("Post-wake verification for {}: {}", name, final_status);
