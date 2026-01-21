@@ -29,13 +29,27 @@ Download the pre-compiled binary for your architecture from the **[Releases](htt
 Create a `config.toml` in the same folder as the binary:
 
 ```toml
-# List of authorized Telegram User IDs
-allowed_users = [123456789, 987654321]
+# --- WOL Bot Configuration ---
 
+# List of Telegram User IDs allowed to control the bot.
+# You can get your ID from bots like @userinfobot
+allowed_users = [
+    123456789, 
+    987654321
+]
+
+# The network interface to use for broadcasting Magic Packets.
+# On OpenWrt, 'br-lan' is the standard bridge for the local network.
+interface = "br-lan"
+
+# Devices mapping: "unique_name" = ["MAC_ADDRESS", "IP_ADDRESS", "TIMEOUT_SECS"]
+# - MAC is used for waking up the device (WOL).
+# - IP is used for checking the status (Ping).
+# - TIMEOUT_SECS is used for ping timeout after wake
 [devices]
-# "Alias" = ["MAC_ADDRESS", "IP_ADDRESS"]
-"gaming-pc" = ["AA:BB:CC:DD:EE:FF", "192.168.1.50"]
-"nas" = ["11:22:33:44:55:66", "192.168.1.100"]
+gaming_pc = ["AA:BB:CC:DD:EE:FF", "192.168.1.10", "30"]
+home_server = ["11:22:33:44:55:66", "192.168.1.20", "60"]
+nas = ["00:11:22:33:44:55", "192.168.1.30", "90"]
 
 ```
 
@@ -54,12 +68,15 @@ export TELOXIDE_TOKEN=your_bot_token_here
 
 Once the bot is running, interact with it via Telegram:
 
-| Command | Description |
-| --- | --- |
-| `/list` | List all configured devices and their aliases. |
-| `/wake <alias>` | Send Magic Packet and check status after 30s. |
-| `/status <alias>` | Instantly ping the device to check if it's UP. |
-| `/help` | Show available commands. |
+ **Command**    | **Description**                                                              
+----------------|------------------------------------------------------------------------------
+ /start         | Displays the welcome message and help menu.                                  
+ /list          | Lists all devices configured in config.toml.                                 
+ /status <name> | Pings a specific device to check if it is reachable.                         
+ /status_all    | Pings all configured devices and returns a report.                           
+ /wake <name>   | Sends the Magic Packet, waits for the configured timeout, and checks status. 
+
+
 
 ---
 
