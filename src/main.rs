@@ -13,8 +13,8 @@ use teloxide::types::ParseMode;
 /// Configuration structure mapped from the TOML file
 #[derive(Deserialize, Debug, Clone)]
 struct Config {
-    allowed_users: Vec<u64>,               // Telegram User IDs permitted to use the bot
-    interface: Option<String>,             // Network interface (e.g., "br-lan")
+    allowed_users: Vec<u64>,   // Telegram User IDs permitted to use the bot
+    interface: Option<String>, // Network interface (e.g., "br-lan")
     devices: HashMap<String, (String, String, String)>, // Device name -> (MAC Address, IP Address, Timeout)
 }
 
@@ -119,9 +119,12 @@ async fn main() {
     // Use the turbofish operator ::<Config> to clarify the target type
     let config: Arc<Config> = Arc::new(match toml::from_str::<Config>(&content) {
         Ok(c) => {
-            log_info!("Configuration loaded. Monitoring {} devices.", c.devices.len());
+            log_info!(
+                "Configuration loaded. Monitoring {} devices.",
+                c.devices.len()
+            );
             c
-        },
+        }
         Err(e) => {
             log_err!("FATAL: TOML parse error: {}", e);
             return;
@@ -198,11 +201,11 @@ async fn main() {
                         if let Some((mac, ip, timeout_str)) = config.devices.get(*name) {
                             let timeout_secs: u64 = timeout_str.parse().unwrap_or(30);
                             log_info!("WAKE REQUEST: User {} is waking {} ({}), timeout: {}", username, name, mac, timeout_secs);
-                            
+
                             // Prepare packet and socket
                             let packet = create_magic_packet(mac).unwrap();
                             let socket = create_wol_socket(config.interface.as_deref()).unwrap();
-                            
+
                             // Send to broadcast address on port 9 (standard WOL port)
                             match socket.send_to(&packet, "255.255.255.255:9") {
                                 Ok(_) => {
@@ -219,7 +222,7 @@ async fn main() {
 
                             // Wait for the OS to boot up before checking status
                             tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
-                            
+
                             let final_status = if is_device_online(ip).await { "✅ ONLINE" } else { "⚠️ STILL OFFLINE" };
                             log_info!("Post-wake verification for {}: {}", name, final_status);
                             bot.send_message(msg.chat.id, format!("Result for <code>{}</code>: {}", name, final_status))
